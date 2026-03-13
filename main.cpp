@@ -47,7 +47,7 @@ static std::string hyperlink(const std::string & url, const std::string & text) 
     return "\033]8;;" + url + "\033\\" + text + "\033]8;;\033\\";
 }
 
-int main() {
+int main(int argc, char * argv[]) {
     const char * home = std::getenv("HOME");
     if (!home) {
         std::cerr << "Cannot determine HOME directory\n";
@@ -55,6 +55,12 @@ int main() {
     }
 
     fs::path hub = fs::path(home) / ".cache" / "huggingface" / "hub";
+
+    if (argc > 1 && std::string(argv[1]) == "--link") {
+        fs::create_symlink(hub, "hub");
+        std::cout << "Created symlink: hub -> " << hub.string() << "\n";
+        return 0;
+    }
 
     if (!fs::is_directory(hub)) {
         std::cerr << "Not a directory: " << hub << "\n";
