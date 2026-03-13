@@ -62,6 +62,12 @@ int main(int argc, char * argv[]) {
         return 0;
     }
 
+    if (argc > 1 && std::string(argv[1]) == "--unlink") {
+        fs::remove("hub");
+        std::cout << "Removed symlink: hub\n";
+        return 0;
+    }
+
     if (!fs::is_directory(hub)) {
         std::cerr << "Not a directory: " << hub << "\n";
         return 1;
