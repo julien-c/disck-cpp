@@ -6,7 +6,7 @@ Lists all cached repos (models, datasets, spaces) with their refs, snapshots, an
 
 ## Sample output
 
-<p align="center"><img src="sample.svg" alt="sample output"/></p>
+<img src="sample.svg" alt="sample output" width="100%"/>
 
 ## Build
 

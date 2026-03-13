@@ -1,4 +1,4 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="720" height="320">
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 720 320">
   <style>
     text { font-family: 'SF Mono', 'Menlo', 'Consolas', monospace; font-size: 13px; }
     .dir { fill: #5c9aff; font-weight: bold; }
