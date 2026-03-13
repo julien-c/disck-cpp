@@ -1,0 +1,27 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="720" height="320">
+  <style>
+    text { font-family: 'SF Mono', 'Menlo', 'Consolas', monospace; font-size: 13px; }
+    .dir { fill: #5c9aff; font-weight: bold; }
+    .dim { fill: #888888; }
+    .txt { fill: #cccccc; }
+  </style>
+  <rect width="720" height="320" rx="8" fill="#1e1e1e"/>
+  <g transform="translate(16, 24)">
+    <text y="0" class="dir">models--deepseek-ai--DeepSeek-R1</text>
+    <text y="20" class="txt">  ref: main</text>
+    <text y="40" class="txt">  snapshot: <tspan class="dim">56d4cbbb4d29f4355bab4b9a39ccb717a14ad5ad</tspan></text>
+    <text y="60" class="txt">    tokenizer_config.json <tspan class="dim">-> ../../blobs/d87fcc88d8d2</tspan></text>
+    <text y="80" class="txt">    tokenizer.json <tspan class="dim">-> ../../blobs/d81c3a6e2093</tspan></text>
+
+    <text y="116" class="dir">models--Helsinki-NLP--opus-mt-en-eo</text>
+    <text y="136" class="txt">  ref: main</text>
+    <text y="156" class="txt">  snapshot: <tspan class="dim">509f90f806102d84592494f79653411803e30be8</tspan></text>
+    <text y="176" class="txt">    target.spm <tspan class="dim">-> ../../blobs/36949fb94e1d</tspan></text>
+    <text y="196" class="txt">    tokenizer_config.json <tspan class="dim">-> ../../blobs/9af7312ed5a2</tspan></text>
+    <text y="216" class="txt">    pytorch_model.bin <tspan class="dim">-> ../../blobs/333fabb9de15</tspan></text>
+
+    <text y="252" class="dir">datasets--openai--gsm8k</text>
+    <text y="272" class="txt">  ref: main</text>
+    <text y="292" class="txt">  snapshot: <tspan class="dim">e53f048856ff4f594e959d75785d2c2d37b678ee</tspan></text>
+  </g>
+</svg>

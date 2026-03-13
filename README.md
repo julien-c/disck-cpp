@@ -4,6 +4,10 @@ Inspect your local Hugging Face cache (`~/.cache/huggingface/hub`).
 
 Lists all cached repos (models, datasets, spaces) with their refs, snapshots, and files. **Folder names are clickable hyperlinks to the corresponding Hugging Face page.**
 
+## Sample output
+
+<p align="center"><img src="sample.svg" alt="sample output"/></p>
+
 ## Build
 
 ```bash
