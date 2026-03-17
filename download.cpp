@@ -17,7 +17,6 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
-#include <filesystem>
 #include <fstream>
 #include <iostream>
 #include <string>
@@ -185,11 +184,9 @@ static std::string format_size(long long bytes) {
 // --- Metadata via HEAD request ---
 
 struct Metadata {
-    std::string url_to_download;
     std::string etag;
     std::string commit_hash;
     long long   size;
-    bool        strip_auth;
 };
 
 static Metadata get_metadata(const std::string & url, const std::string & token) {
@@ -207,18 +204,12 @@ static Metadata get_metadata(const std::string & url, const std::string & token)
         hdrs.emplace("Authorization", "Bearer " + token);
     }
 
+    // First HEAD without following redirects — get metadata from HF server
     auto res = cli.Head(parsed.path, hdrs);
     if (!res) {
         throw std::runtime_error("HEAD request failed: " + httplib::to_string(res.error()));
     }
-
-    // Handle redirect: extract CDN URL from Location header
-    std::string effective_url = url;
-    if (res->status >= 300 && res->status < 400) {
-        if (res->has_header("Location")) {
-            effective_url = res->get_header_value("Location");
-        }
-    } else if (res->status >= 400) {
+    if (res->status >= 400) {
         throw std::runtime_error("HTTP " + std::to_string(res->status) + " for " + url);
     }
 
@@ -238,7 +229,17 @@ static Metadata get_metadata(const std::string & url, const std::string & token)
     }
     meta.etag = normalize_etag(raw_etag);
 
+    // For LFS/Xet files, X-Linked-Size gives the real file size.
+    // For small files served directly, the 3xx Content-Length is the redirect body —
+    // follow the (same-host) redirect to get the actual size.
     std::string size_str = res->get_header_value("X-Linked-Size");
+    if (size_str.empty() && res->status >= 300 && res->status < 400) {
+        cli.set_follow_location(true);
+        auto res2 = cli.Head(parsed.path, hdrs);
+        if (res2 && res2->status == 200) {
+            size_str = res2->get_header_value("Content-Length");
+        }
+    }
     if (size_str.empty()) {
         size_str = res->get_header_value("Content-Length");
     }
@@ -247,17 +248,53 @@ static Metadata get_metadata(const std::string & url, const std::string & token)
     }
     meta.size = std::stoll(size_str);
 
-    meta.url_to_download = effective_url;
-    meta.strip_auth      = (url != effective_url && extract_host(url) != extract_host(effective_url));
-
     return meta;
+}
+
+// --- Resolve redirect: GET without following, return final URL + whether to strip auth ---
+
+struct ResolvedUrl {
+    std::string url;
+    bool        strip_auth;
+};
+
+static ResolvedUrl resolve_redirect(const std::string & url, const std::string & token) {
+    auto            parsed = parse_url(url);
+    httplib::Client cli(parsed.scheme_host);
+    cli.set_follow_location(false);
+    cli.set_connection_timeout(DOWNLOAD_TIMEOUT);
+    cli.set_read_timeout(DOWNLOAD_TIMEOUT);
+
+    httplib::Headers hdrs = {
+        { "User-Agent", "hf_hub_download/standalone-cpp" },
+    };
+    if (!token.empty()) {
+        hdrs.emplace("Authorization", "Bearer " + token);
+    }
+
+    auto res = cli.Head(parsed.path, hdrs);
+    if (!res) {
+        return { url, false };
+    }
+
+    if (res->status >= 300 && res->status < 400 && res->has_header("Location")) {
+        std::string location = res->get_header_value("Location");
+        // Handle relative redirect (e.g. "/api/resolve-cache/...")
+        if (!location.empty() && location[0] == '/') {
+            location = parsed.scheme_host + location;
+        }
+        bool strip = extract_host(url) != extract_host(location);
+        return { location, strip };
+    }
+
+    return { url, false };
 }
 
 // --- Streaming GET with resume and progress ---
 
 static void http_get(const std::string & url,
-                     const std::string & temp_path,
                      const std::string & token,
+                     const std::string & temp_path,
                      long long           expected_size,
                      const std::string & filename,
                      bool                force,
@@ -270,6 +307,10 @@ static void http_get(const std::string & url,
         }
     }
 
+    // Resolve redirect: GET the HF URL to find the actual download URL,
+    // then strip auth if it redirects to a different host (CDN).
+    auto [dl_url, strip_auth] = resolve_redirect(url, token);
+
     FILE * fp = fopen(temp_path.c_str(), resume_size > 0 ? "r+b" : "wb");
     if (!fp) {
         throw std::runtime_error("Cannot open " + temp_path);
@@ -278,16 +319,17 @@ static void http_get(const std::string & url,
         fseek(fp, 0, SEEK_END);
     }
 
-    auto            parsed = parse_url(url);
+    auto            parsed = parse_url(dl_url);
     httplib::Client cli(parsed.scheme_host);
     cli.set_follow_location(true);
+    cli.set_url_encode(false);
     cli.set_connection_timeout(DOWNLOAD_TIMEOUT);
     cli.set_read_timeout(DOWNLOAD_TIMEOUT);
 
     httplib::Headers hdrs = {
         { "User-Agent", "hf_hub_download/standalone-cpp" },
     };
-    if (!token.empty()) {
+    if (!token.empty() && !strip_auth) {
         hdrs.emplace("Authorization", "Bearer " + token);
     }
     if (resume_size > 0) {
@@ -341,13 +383,13 @@ static void http_get(const std::string & url,
         if (retries > 0 && (err == httplib::Error::Connection || err == httplib::Error::Read ||
                             err == httplib::Error::ConnectionTimeout)) {
             fprintf(stderr, "Retrying (%d left)...\n", retries - 1);
-            http_get(url, temp_path, token, expected_size, filename, false, retries - 1);
+            http_get(url, token, temp_path, expected_size, filename, false, retries - 1);
             return;
         }
         throw std::runtime_error("Download failed: " + httplib::to_string(err));
     }
     if (res->status >= 400) {
-        throw std::runtime_error("HTTP " + std::to_string(res->status) + " downloading " + url);
+        throw std::runtime_error("HTTP " + std::to_string(res->status) + " downloading " + dl_url);
     }
 
     long long final_size = (long long) fs::file_size(temp_path);
@@ -425,8 +467,7 @@ static std::string hf_hub_download(const std::string & repo_id,
         fs::remove(incomplete, ec);
     }
 
-    std::string dl_token = meta.strip_auth ? "" : token;
-    http_get(meta.url_to_download, incomplete, dl_token, meta.size, filename, force_download);
+    http_get(url, token, incomplete, meta.size, filename, force_download);
 
     fs::rename(incomplete, blob_path);
     create_symlink(blob_path, pp.string());
