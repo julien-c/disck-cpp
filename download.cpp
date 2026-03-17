@@ -1,5 +1,5 @@
 // download.cpp — Standalone C++ implementation of hf_hub_download.
-// Minimal dependency: libcurl (pre-installed on macOS and most Linux).
+// Dependency: cpp-httplib (vendored) + OpenSSL for HTTPS.
 //
 // Usage:
 //   ./download <repo_id> <filename> [--token TOKEN] [--revision REV] [--repo-type TYPE] [--force]
@@ -8,7 +8,9 @@
 //   ./download google/flan-t5-base config.json
 //   ./download username/my-dataset data.csv --repo-type dataset
 
-#include <curl/curl.h>
+#define CPPHTTPLIB_OPENSSL_SUPPORT
+#include "vendor/httplib.h"
+
 #include <unistd.h>
 
 #include <algorithm>
@@ -29,14 +31,6 @@ static std::string get_env(const char * name, const std::string & fallback = "")
     return v ? v : fallback;
 }
 
-static std::string get_endpoint() {
-    std::string s = get_env("HF_ENDPOINT", "https://huggingface.co");
-    while (!s.empty() && s.back() == '/') {
-        s.pop_back();
-    }
-    return s;
-}
-
 static std::string get_default_cache() {
     std::string v = get_env("HF_HUB_CACHE");
     if (!v.empty()) {
@@ -53,23 +47,42 @@ static std::string get_default_cache() {
     return xdg + "/huggingface/hub";
 }
 
-static const std::string ENDPOINT         = get_endpoint();
+static const std::string ENDPOINT         = "https://huggingface.co";
 static const std::string DEFAULT_REVISION = "main";
 static const std::string DEFAULT_CACHE    = get_default_cache();
-static const long        ETAG_TIMEOUT     = 10;
-static const long        DOWNLOAD_TIMEOUT = 10;
+static const int         ETAG_TIMEOUT     = 10;
+static const int         DOWNLOAD_TIMEOUT = 10;
 
 // --- URL helpers ---
 
-static std::string url_encode(const std::string & s) {
-    CURL * curl = curl_easy_init();
-    if (!curl) {
-        return s;
+struct ParsedUrl {
+    std::string scheme_host;  // e.g. "https://huggingface.co"
+    std::string path;         // e.g. "/user/repo/resolve/main/file.json"
+};
+
+static ParsedUrl parse_url(const std::string & url) {
+    auto scheme_end = url.find("://");
+    if (scheme_end == std::string::npos) {
+        return { url, "/" };
     }
-    char *      enc    = curl_easy_escape(curl, s.c_str(), (int) s.size());
-    std::string result = enc ? enc : s;
-    curl_free(enc);
-    curl_easy_cleanup(curl);
+    auto path_start = url.find('/', scheme_end + 3);
+    if (path_start == std::string::npos) {
+        return { url, "/" };
+    }
+    return { url.substr(0, path_start), url.substr(path_start) };
+}
+
+static std::string url_encode(const std::string & s) {
+    std::string result;
+    for (unsigned char c : s) {
+        if (std::isalnum(c) || c == '-' || c == '_' || c == '.' || c == '~') {
+            result += (char) c;
+        } else {
+            char buf[4];
+            snprintf(buf, sizeof(buf), "%%%02X", c);
+            result += buf;
+        }
+    }
     return result;
 }
 
@@ -171,55 +184,6 @@ static std::string format_size(long long bytes) {
 
 // --- Metadata via HEAD request ---
 
-struct MetadataHeaders {
-    std::string x_repo_commit;
-    std::string x_linked_etag;
-    std::string x_linked_size;
-    std::string etag;
-    std::string content_length;
-};
-
-static size_t meta_header_cb(char * buf, size_t sz, size_t n, void * ud) {
-    auto * h     = static_cast<MetadataHeaders *>(ud);
-    size_t total = sz * n;
-
-    std::string line(buf, total);
-    auto        colon = line.find(':');
-    if (colon == std::string::npos) {
-        return total;
-    }
-
-    std::string key = line.substr(0, colon);
-    std::string val = line.substr(colon + 1);
-    while (!val.empty() && (val.front() == ' ' || val.front() == '\t')) {
-        val.erase(val.begin());
-    }
-    while (!val.empty() && (val.back() == '\r' || val.back() == '\n')) {
-        val.pop_back();
-    }
-
-    std::string lk(key.size(), '\0');
-    std::transform(key.begin(), key.end(), lk.begin(), ::tolower);
-
-    if (lk == "x-repo-commit") {
-        h->x_repo_commit = val;
-    } else if (lk == "x-linked-etag") {
-        h->x_linked_etag = val;
-    } else if (lk == "x-linked-size") {
-        h->x_linked_size = val;
-    } else if (lk == "etag") {
-        h->etag = val;
-    } else if (lk == "content-length") {
-        h->content_length = val;
-    }
-
-    return total;
-}
-
-static size_t discard_body(char *, size_t sz, size_t n, void *) {
-    return sz * n;
-}
-
 struct Metadata {
     std::string url_to_download;
     std::string etag;
@@ -229,62 +193,55 @@ struct Metadata {
 };
 
 static Metadata get_metadata(const std::string & url, const std::string & token) {
-    CURL * curl = curl_easy_init();
-    if (!curl) {
-        throw std::runtime_error("Failed to init curl");
-    }
+    auto            parsed = parse_url(url);
+    httplib::Client cli(parsed.scheme_host);
+    cli.set_follow_location(false);
+    cli.set_connection_timeout(ETAG_TIMEOUT);
+    cli.set_read_timeout(ETAG_TIMEOUT);
 
-    MetadataHeaders hdrs;
-
-    struct curl_slist * req_hdrs = nullptr;
-    req_hdrs                     = curl_slist_append(req_hdrs, "User-Agent: hf_hub_download/standalone-cpp");
-    req_hdrs                     = curl_slist_append(req_hdrs, "Accept-Encoding: identity");
+    httplib::Headers hdrs = {
+        { "User-Agent",      "hf_hub_download/standalone-cpp" },
+        { "Accept-Encoding", "identity"                       },
+    };
     if (!token.empty()) {
-        req_hdrs = curl_slist_append(req_hdrs, ("Authorization: Bearer " + token).c_str());
+        hdrs.emplace("Authorization", "Bearer " + token);
     }
 
-    curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
-    curl_easy_setopt(curl, CURLOPT_NOBODY, 1L);
-    curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
-    curl_easy_setopt(curl, CURLOPT_TIMEOUT, ETAG_TIMEOUT);
-    curl_easy_setopt(curl, CURLOPT_HTTPHEADER, req_hdrs);
-    curl_easy_setopt(curl, CURLOPT_HEADERFUNCTION, meta_header_cb);
-    curl_easy_setopt(curl, CURLOPT_HEADERDATA, &hdrs);
-    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, discard_body);
-
-    CURLcode res = curl_easy_perform(curl);
-
-    long http_code = 0;
-    curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http_code);
-
-    char * eff_url = nullptr;
-    curl_easy_getinfo(curl, CURLINFO_EFFECTIVE_URL, &eff_url);
-    std::string effective_url = eff_url ? eff_url : url;
-
-    curl_slist_free_all(req_hdrs);
-    curl_easy_cleanup(curl);
-
-    if (res != CURLE_OK) {
-        throw std::runtime_error(std::string("HEAD request failed: ") + curl_easy_strerror(res));
+    auto res = cli.Head(parsed.path, hdrs);
+    if (!res) {
+        throw std::runtime_error("HEAD request failed: " + httplib::to_string(res.error()));
     }
-    if (http_code >= 400) {
-        throw std::runtime_error("HTTP " + std::to_string(http_code) + " for " + url);
+
+    // Handle redirect: extract CDN URL from Location header
+    std::string effective_url = url;
+    if (res->status >= 300 && res->status < 400) {
+        if (res->has_header("Location")) {
+            effective_url = res->get_header_value("Location");
+        }
+    } else if (res->status >= 400) {
+        throw std::runtime_error("HTTP " + std::to_string(res->status) + " for " + url);
     }
 
     Metadata meta;
 
-    meta.commit_hash = hdrs.x_repo_commit;
+    meta.commit_hash = res->get_header_value("X-Repo-Commit");
     if (meta.commit_hash.empty()) {
         throw std::runtime_error("Server did not return X-Repo-Commit header.");
     }
 
-    std::string raw_etag = hdrs.x_linked_etag.empty() ? hdrs.etag : hdrs.x_linked_etag;
+    std::string raw_etag = res->get_header_value("X-Linked-Etag");
+    if (raw_etag.empty()) {
+        raw_etag = res->get_header_value("ETag");
+    }
     if (raw_etag.empty()) {
         throw std::runtime_error("Server did not return an ETag header.");
     }
     meta.etag = normalize_etag(raw_etag);
 
-    std::string size_str = hdrs.x_linked_size.empty() ? hdrs.content_length : hdrs.x_linked_size;
+    std::string size_str = res->get_header_value("X-Linked-Size");
+    if (size_str.empty()) {
+        size_str = res->get_header_value("Content-Length");
+    }
     if (size_str.empty()) {
         throw std::runtime_error("Server did not return Content-Length.");
     }
@@ -297,68 +254,6 @@ static Metadata get_metadata(const std::string & url, const std::string & token)
 }
 
 // --- Streaming GET with resume and progress ---
-
-struct DownloadState {
-    FILE *      fp;
-    long long   resume_size;
-    long long   expected_size;
-    int         http_status;
-    bool        truncated;
-    std::string filename;
-};
-
-static size_t dl_header_cb(char * buf, size_t sz, size_t n, void * ud) {
-    auto *      s     = static_cast<DownloadState *>(ud);
-    size_t      total = sz * n;
-    std::string line(buf, total);
-    if (line.compare(0, 5, "HTTP/") == 0) {
-        auto sp = line.find(' ');
-        if (sp != std::string::npos) {
-            s->http_status = std::atoi(line.c_str() + sp + 1);
-        }
-    }
-    return total;
-}
-
-static size_t dl_write_cb(char * ptr, size_t sz, size_t n, void * ud) {
-    auto * s     = static_cast<DownloadState *>(ud);
-    size_t total = sz * n;
-    // Server returned 200 (full content) instead of 206 — restart from scratch
-    if (s->resume_size > 0 && s->http_status == 200 && !s->truncated) {
-        fseek(s->fp, 0, SEEK_SET);
-        ftruncate(fileno(s->fp), 0);
-        s->resume_size = 0;
-        s->truncated   = true;
-    }
-    return fwrite(ptr, 1, total, s->fp);
-}
-
-static int dl_progress_cb(void * ud, curl_off_t /*dltotal*/, curl_off_t dlnow, curl_off_t, curl_off_t) {
-    auto *    s     = static_cast<DownloadState *>(ud);
-    long long total = s->expected_size;
-    long long now   = dlnow + s->resume_size;
-    if (total <= 0) {
-        return 0;
-    }
-
-    double frac   = std::min((double) now / total, 1.0);
-    int    width  = 40;
-    int    filled = (int) (frac * width);
-
-    std::string fname = s->filename;
-    if (fname.size() > 40) {
-        fname = "(…)" + fname.substr(fname.size() - 37);
-    }
-
-    char bar[41];
-    memset(bar, '#', filled);
-    memset(bar + filled, '-', width - filled);
-    bar[width] = '\0';
-
-    fprintf(stderr, "\r%-40s [%s] %s / %s  ", fname.c_str(), bar, format_size(now).c_str(), format_size(total).c_str());
-    fflush(stderr);
-    return 0;
-}
 
 static void http_get(const std::string & url,
                      const std::string & temp_path,
@@ -383,57 +278,76 @@ static void http_get(const std::string & url,
         fseek(fp, 0, SEEK_END);
     }
 
-    DownloadState state{ fp, resume_size, expected_size, 0, false, filename };
+    auto            parsed = parse_url(url);
+    httplib::Client cli(parsed.scheme_host);
+    cli.set_follow_location(true);
+    cli.set_connection_timeout(DOWNLOAD_TIMEOUT);
+    cli.set_read_timeout(DOWNLOAD_TIMEOUT);
 
-    CURL * curl = curl_easy_init();
-    if (!curl) {
-        fclose(fp);
-        throw std::runtime_error("Failed to init curl");
-    }
-
-    struct curl_slist * hdrs = nullptr;
-    hdrs                     = curl_slist_append(hdrs, "User-Agent: hf_hub_download/standalone-cpp");
+    httplib::Headers hdrs = {
+        { "User-Agent", "hf_hub_download/standalone-cpp" },
+    };
     if (!token.empty()) {
-        hdrs = curl_slist_append(hdrs, ("Authorization: Bearer " + token).c_str());
+        hdrs.emplace("Authorization", "Bearer " + token);
     }
     if (resume_size > 0) {
-        hdrs = curl_slist_append(hdrs, ("Range: bytes=" + std::to_string(resume_size) + "-").c_str());
+        hdrs.emplace("Range", "bytes=" + std::to_string(resume_size) + "-");
     }
 
-    curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
-    curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
-    curl_easy_setopt(curl, CURLOPT_HTTPHEADER, hdrs);
-    curl_easy_setopt(curl, CURLOPT_HEADERFUNCTION, dl_header_cb);
-    curl_easy_setopt(curl, CURLOPT_HEADERDATA, &state);
-    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, dl_write_cb);
-    curl_easy_setopt(curl, CURLOPT_WRITEDATA, &state);
-    curl_easy_setopt(curl, CURLOPT_XFERINFOFUNCTION, dl_progress_cb);
-    curl_easy_setopt(curl, CURLOPT_XFERINFODATA, &state);
-    curl_easy_setopt(curl, CURLOPT_NOPROGRESS, 0L);
-    curl_easy_setopt(curl, CURLOPT_LOW_SPEED_LIMIT, 1L);
-    curl_easy_setopt(curl, CURLOPT_LOW_SPEED_TIME, DOWNLOAD_TIMEOUT);
+    // Truncated filename for display
+    std::string display_name = filename;
+    if (display_name.size() > 40) {
+        display_name = "(...)" + display_name.substr(display_name.size() - 35);
+    }
 
-    CURLcode res       = curl_easy_perform(curl);
-    long     http_code = 0;
-    curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http_code);
+    long long current_resume = resume_size;
 
-    curl_slist_free_all(hdrs);
-    curl_easy_cleanup(curl);
+    auto res = cli.Get(
+        parsed.path, hdrs,
+        // Response handler: check if server returned 200 instead of 206
+        [&](const httplib::Response & response) -> bool {
+            if (current_resume > 0 && response.status == 200) {
+                fseek(fp, 0, SEEK_SET);
+                ftruncate(fileno(fp), 0);
+                current_resume = 0;
+            }
+            return true;
+        },
+        // Content receiver
+        [&](const char * data, size_t len) -> bool { return fwrite(data, 1, len, fp) == len; },
+        // Progress
+        [&](uint64_t current, uint64_t /*total*/) -> bool {
+            long long now    = (long long) current + current_resume;
+            double    frac   = std::min((double) now / expected_size, 1.0);
+            int       width  = 40;
+            int       filled = (int) (frac * width);
+
+            char bar[41];
+            memset(bar, '#', filled);
+            memset(bar + filled, '-', width - filled);
+            bar[width] = '\0';
+
+            fprintf(stderr, "\r%-40s [%s] %s / %s  ", display_name.c_str(), bar, format_size(now).c_str(),
+                    format_size(expected_size).c_str());
+            fflush(stderr);
+            return true;
+        });
+
     fclose(fp);
-
     fprintf(stderr, "\n");
 
-    if (res != CURLE_OK) {
-        if (retries > 0 &&
-            (res == CURLE_OPERATION_TIMEDOUT || res == CURLE_COULDNT_CONNECT || res == CURLE_PARTIAL_FILE)) {
+    if (!res) {
+        auto err = res.error();
+        if (retries > 0 && (err == httplib::Error::Connection || err == httplib::Error::Read ||
+                            err == httplib::Error::ConnectionTimeout)) {
             fprintf(stderr, "Retrying (%d left)...\n", retries - 1);
             http_get(url, temp_path, token, expected_size, filename, false, retries - 1);
             return;
         }
-        throw std::runtime_error(std::string("Download failed: ") + curl_easy_strerror(res));
+        throw std::runtime_error("Download failed: " + httplib::to_string(err));
     }
-    if (http_code >= 400) {
-        throw std::runtime_error("HTTP " + std::to_string(http_code) + " downloading " + url);
+    if (res->status >= 400) {
+        throw std::runtime_error("HTTP " + std::to_string(res->status) + " downloading " + url);
     }
 
     long long final_size = (long long) fs::file_size(temp_path);
@@ -582,17 +496,13 @@ int main(int argc, char * argv[]) {
         token = get_env("HF_TOKEN");
     }
 
-    curl_global_init(CURL_GLOBAL_DEFAULT);
-
     try {
         std::string path = hf_hub_download(repo_id, filename, repo_type, revision, token, force);
         std::cout << path << "\n";
     } catch (const std::exception & e) {
         fprintf(stderr, "Error: %s\n", e.what());
-        curl_global_cleanup();
         return 1;
     }
 
-    curl_global_cleanup();
     return 0;
 }

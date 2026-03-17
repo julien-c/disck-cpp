@@ -1,4 +1,5 @@
 hf-cache-dirs
 download
+*.dSYM/
 hub
 .claude/settings.local.json

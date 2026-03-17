@@ -1,0 +1,12 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "build-download",
+      "type": "shell",
+      "command": "make download",
+      "group": "build",
+      "problemMatcher": "$gcc"
+    }
+  ]
+}

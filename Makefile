@@ -1,13 +1,15 @@
 CXX = c++
-CXXFLAGS = -std=c++17 -Wall
+CXXFLAGS = -std=c++17 -Wall -g -O0
 
 all: hf-cache-dirs download
 
 hf-cache-dirs: main.cpp
 	$(CXX) $(CXXFLAGS) -o $@ $<
 
-download: download.cpp
-	$(CXX) $(CXXFLAGS) -o $@ $< -lcurl
+OPENSSL_PREFIX := $(shell brew --prefix openssl 2>/dev/null || echo /usr/local/opt/openssl)
+
+download: download.cpp vendor/httplib.h
+	$(CXX) $(CXXFLAGS) -I$(OPENSSL_PREFIX)/include -L$(OPENSSL_PREFIX)/lib -o $@ $< -lssl -lcrypto
 
 format:
 	clang-format -i main.cpp download.cpp
